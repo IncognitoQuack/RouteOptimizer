@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simple GPS Route Optimizer (Improved)</title>
+
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+          integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+          crossorigin=""/>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+            crossorigin=""></script>
+
+    <style>
+        /* Basic page styling */
+        html, body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            font-family: sans-serif;
+        }
+
+        /* Map container */
+        #map {
+            height: 100vh; /* Full viewport height */
+            width: 100%;
+        }
+
+        /* Info panel for instructions, results, errors */
+        #info-panel {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(255, 255, 255, 0.9);
+            padding: 10px 15px;
+            border-radius: 5px;
+            box-shadow: 0 1px 5px rgba(0,0,0,0.2);
+            z-index: 1000; /* Ensure it's above the map */
+            max-width: 280px; /* Slightly wider for longer messages */
+            font-size: 0.9em;
+        }
+
+        /* Styling for loading/error messages */
+        .status-message {
+            font-style: italic;
+            color: #555;
+        }
+        .error-message {
+            color: #D8000C; /* Red for errors */
+             background-color: #FFD2D2; /* Light red background */
+             padding: 5px;
+             border-radius: 3px;
+             font-weight: bold;
+        }
+        .warning-message {
+             color: #9F6000; /* Orange/brown for warnings */
+             background-color: #FEEFB3; /* Light yellow background */
+             padding: 5px;
+             border-radius: 3px;
+             font-weight: bold;
+        }
+        .loading-message {
+            color: blue;
+            font-weight: bold;
+        }
+        .result-message strong {
+            color: #005000; /* Dark green for results */
+        }
+
+
+        /* Reset button */
+        #reset-button {
+            position: absolute;
+            bottom: 20px;
+            left: 10px;
+            z-index: 1000;
+            padding: 8px 12px;
+            background-color: #f8f8f8;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 1em;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+        }
+        #reset-button:hover {
+            background-color: #eee;
+        }
+
+         /* Default styling for Leaflet popups */
+        .leaflet-popup-content-wrapper {
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="map"></div>
+
+    <div id="info-panel">
+        <p>Click on the map to set the <strong>Start</strong> point.</p>
+    </div>
+
+    <button id="reset-button">Reset</button>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            // --- Configuration ---
+            const OVERPASS_API_URL = 'https://overpass-api.de/api/interpreter';
+            const DEFAULT_SPEED_KMH = 50; // Assumed average speed for ETA calculation
+            const BBOX_BUFFER = 0.01; // Degrees buffer (adjust as needed, slightly larger might be okay with filtered query)
+            const MAX_GRAPH_NODES = 15000; // Max nodes to handle before aborting Dijkstra
+
+            // --- Leaflet Map Initialization ---
+            const map = L.map('map').setView([51.505, -0.09], 13); // Default view (London)
+
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+            }).addTo(map);
+
+            // --- DOM Element References ---
+            const infoPanel = document.getElementById('info-panel');
+            const resetButton = document.getElementById('reset-button');
+
+            // --- State Variables ---
+            let startMarker = null;
+            let endMarker = null;
+            let startCoords = null;
+            let endCoords = null;
+            let routeLayerGroup = L.layerGroup().addTo(map);
+            let mapGraph = {};
+            let nodesLookup = {};
+            let isLoading = false;
+
+            // --- Core Functions ---
+
+            /**
+             * Displays messages in the info panel.
+             * @param {string} htmlContent - The HTML content to display.
+             * @param {string} type - 'error', 'warning', 'loading', 'status', 'result'.
+             */
+            function updateInfoPanel(htmlContent, type = '') {
+                let className = '';
+                if (type === 'error') className = 'error-message';
+                else if (type === 'warning') className = 'warning-message';
+                else if (type === 'loading') className = 'loading-message';
+                else if (type === 'status') className = 'status-message';
+                else if (type === 'result') className = 'result-message'; // Added for clarity
+
+                // Wrap content in a paragraph for consistent styling
+                infoPanel.innerHTML = `<p class="${className}">${htmlContent}</p>`;
+            }
+
+            /**
+             * Calculates Haversine distance. (Same as before)
+             * @returns {number} Distance in kilometers.
+             */
+            function haversineDistance(coords1, coords2) {
+                function toRad(x) { return x * Math.PI / 180; }
+                const R = 6371; // km
+                const dLat = toRad(coords2.lat - coords1.lat);
+                const dLon = toRad(coords2.lon - coords1.lon);
+                const lat1 = toRad(coords1.lat);
+                const lat2 = toRad(coords2.lat);
+                const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                          Math.sin(dLon/2) * Math.sin(dLon/2) * Math.cos(lat1) * Math.cos(lat2);
+                const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+                return R * c;
+            }
+
+            /**
+             * Finds the closest node in the graph to given coordinates. (Same as before)
+             * @param {object} targetCoords - {lat, lon}.
+             * @returns {number|null} Node ID or null.
+             */
+            function findNearestNode(targetCoords) {
+                let nearestNodeId = null;
+                let minDistance = Infinity;
+                for (const nodeId in nodesLookup) {
+                    const nodeCoords = nodesLookup[nodeId];
+                    const distance = haversineDistance(targetCoords, nodeCoords);
+                    if (distance < minDistance) {
+                        minDistance = distance;
+                        nearestNodeId = parseInt(nodeId, 10);
+                    }
+                }
+                return nearestNodeId;
+            }
+
+            /**
+             * Fetches *filtered* OSM highway data.
+             */
+            async function fetchOsmData() {
+                if (!startCoords || !endCoords) return;
+                if (isLoading) return;
+
+                isLoading = true;
+                resetRouteDisplay(); // Clear previous route visually immediately
+                updateInfoPanel('Fetching road data...', 'loading');
+
+                const minLat = Math.min(startCoords.lat, endCoords.lat) - BBOX_BUFFER;
+                const minLon = Math.min(startCoords.lng, endCoords.lng) - BBOX_BUFFER;
+                const maxLat = Math.max(startCoords.lat, endCoords.lat) + BBOX_BUFFER;
+                const maxLon = Math.max(startCoords.lng, endCoords.lng) + BBOX_BUFFER;
+                const bbox = `${minLat},${minLon},${maxLat},${maxLon}`;
+
+                // **IMPROVED QUERY:** Filter for major road types only
+                const query = `
+                    [out:json][timeout:30]; // Increased timeout slightly
+                    (
+                      // Select ways with specific highway tags within the bbox
+                      way["highway"~"^(primary|secondary|tertiary|trunk|motorway|primary_link|secondary_link|tertiary_link|trunk_link|motorway_link)$"](${bbox});
+                    );
+                    // Get nodes for these ways, and ways connected to those nodes ('>')
+                    (._;>;);
+                    // Output the result
+                    out body;
+                `;
+
+                const url = `${OVERPASS_API_URL}?data=${encodeURIComponent(query)}`;
+
+                try {
+                    const response = await fetch(url);
+                    if (!response.ok) {
+                        // Try to get error message from Overpass if available
+                         let errorBody = await response.text();
+                         let simpleError = `Overpass API Error: ${response.status} ${response.statusText}`;
+                         console.error("Overpass API Error Response Body:", errorBody);
+                         // Extract remark if possible
+                         const remarkMatch = errorBody.match(/<remark>(.*?)<\/remark>/);
+                         if (remarkMatch && remarkMatch[1]) {
+                            simpleError += ` - ${remarkMatch[1].trim()}`;
+                         }
+                        throw new Error(simpleError);
+                    }
+                    const osmData = await response.json();
+                    console.log(`OSM Data Received: ${osmData.elements.length} elements`);
+
+                    // Defensive check for empty results
+                    if (!osmData || !osmData.elements || osmData.elements.length === 0) {
+                        updateInfoPanel('No major road data found in the selected area. Try different points or zoom levels.', 'warning');
+                         isLoading = false;
+                         return;
+                    }
+
+                    // Proceed to graph building (wrapped in try...catch)
+                    try {
+                        buildGraph(osmData);
+                    } catch (graphError) {
+                         console.error('Error during graph building:', graphError);
+                         updateInfoPanel(`Error processing road data: ${graphError.message}.`, 'error');
+                         isLoading = false;
+                    }
+
+                } catch (error) {
+                    console.error('Failed to fetch or process OSM data:', error);
+                    updateInfoPanel(`Network or API Error: ${error.message}. Check connection or try later.`, 'error');
+                    isLoading = false; // Reset loading flag on error
+                }
+            }
+
+            /**
+             * Builds the graph and triggers pathfinding if graph size is acceptable.
+             * @param {object} osmData - JSON data from Overpass.
+             */
+            function buildGraph(osmData) {
+                 console.log('Building graph...');
+                 mapGraph = {}; // Reset graph
+                 nodesLookup = {}; // Reset node lookup
+
+                 // 1. Store nodes
+                 osmData.elements.forEach(el => {
+                     if (el.type === 'node' && el.lat !== undefined && el.lon !== undefined) {
+                        nodesLookup[el.id] = { lat: el.lat, lon: el.lon };
+                        if (!mapGraph[el.id]) {
+                            mapGraph[el.id] = { lat: el.lat, lon: el.lon, neighbors: {} };
+                        }
+                     }
+                 });
+
+                 // 2. Process ways for edges
+                 osmData.elements.forEach(el => {
+                    if (el.type === 'way' && el.nodes && el.nodes.length > 1) {
+                        for (let i = 0; i < el.nodes.length - 1; i++) {
+                            const node1Id = el.nodes[i];
+                            const node2Id = el.nodes[i+1];
+                            const node1Coords = nodesLookup[node1Id];
+                            const node2Coords = nodesLookup[node2Id];
+
+                            if (node1Coords && node2Coords) {
+                                const distance = haversineDistance(node1Coords, node2Coords);
+                                if (distance > 0) {
+                                    if (!mapGraph[node1Id]) mapGraph[node1Id] = { ...node1Coords, neighbors: {} };
+                                    if (!mapGraph[node2Id]) mapGraph[node2Id] = { ...node2Coords, neighbors: {} };
+                                    mapGraph[node1Id].neighbors[node2Id] = distance;
+                                    mapGraph[node2Id].neighbors[node1Id] = distance;
+                                }
+                            }
+                        }
+                    }
+                });
+
+                const nodeCount = Object.keys(mapGraph).length;
+                console.log(`Graph built with ${nodeCount} nodes.`);
+
+                // **NEW:** Check graph size before running Dijkstra
+                if (nodeCount > MAX_GRAPH_NODES) {
+                    console.warn(`Graph size (${nodeCount} nodes) exceeds limit (${MAX_GRAPH_NODES}). Aborting pathfinding.`);
+                    updateInfoPanel(`The selected area is too complex (found ${nodeCount} road intersections, limit ${MAX_GRAPH_NODES}). Please choose points closer together or in a less dense area.`, 'warning');
+                    isLoading = false; // Abort further processing
+                    return;
+                }
+
+                if (nodeCount === 0) {
+                     updateInfoPanel('No processable road intersections found in the graph. Try different points.', 'warning');
+                     isLoading = false;
+                     return;
+                 }
+
+                // Find nearest graph nodes
+                const startNodeId = findNearestNode({ lat: startCoords.lat, lon: startCoords.lng });
+                const endNodeId = findNearestNode({ lat: endCoords.lat, lon: endCoords.lng });
+
+                if (startNodeId === null || endNodeId === null) {
+                    updateInfoPanel('Could not map start/end points to the road network. Ensure points are near roads.', 'error');
+                    isLoading = false;
+                    return;
+                }
+                if (startNodeId === endNodeId) {
+                    updateInfoPanel('Start and End points map to the same road location. No route needed.', 'status');
+                    drawRoute([startNodeId]); // Draw the single node location
+                    isLoading = false;
+                    return;
+                }
+
+                console.log(`Mapped Start click to Node ID: ${startNodeId}`);
+                console.log(`Mapped End click to Node ID: ${endNodeId}`);
+
+                 // Run Dijkstra (wrapped in try...catch)
+                 try {
+                    findShortestPath(startNodeId, endNodeId);
+                 } catch(pathError) {
+                     console.error('Error during pathfinding:', pathError);
+                     updateInfoPanel(`Error calculating route: ${pathError.message}.`, 'error');
+                     isLoading = false;
+                 }
+            }
+
+            /**
+             * Dijkstra's algorithm (Basic O(V^2) version - unchanged logic but benefits from smaller graph).
+             * @param {number} startNodeId
+             * @param {number} endNodeId
+             */
+            function findShortestPath(startNodeId, endNodeId) {
+                 console.log(`Running Dijkstra from ${startNodeId} to ${endNodeId}...`);
+                 updateInfoPanel('Calculating shortest path...', 'loading'); // Update panel during calculation
+
+                 const distances = {};
+                 const prev = {};
+                 const visited = new Set();
+                 const nodesToVisit = {}; // Using object as a makeshift set/lookup for unvisited nodes
+
+                 for (const nodeId in mapGraph) {
+                     distances[nodeId] = Infinity;
+                     prev[nodeId] = null;
+                     nodesToVisit[nodeId] = true; // Mark all as needing visit
+                 }
+                 distances[startNodeId] = 0;
+
+                 let nodeCount = Object.keys(mapGraph).length;
+                 let processedNodes = 0;
+
+                 while (Object.keys(nodesToVisit).length > 0) {
+                     // Find the node with the smallest distance among unvisited nodes
+                     let u = null;
+                     let minDistance = Infinity;
+                     for(const nodeId in nodesToVisit) {
+                        if (distances[nodeId] <= minDistance) {
+                            minDistance = distances[nodeId];
+                            u = nodeId;
+                        }
+                     }
+
+                     // If the smallest distance is Infinity, remaining nodes are unreachable
+                     if (minDistance === Infinity) {
+                         console.log("Remaining nodes unreachable.");
+                         break;
+                     }
+
+                      // Optimization: If we extract the end node, we found the shortest path
+                      if (u == endNodeId) { // Use == for string/number comparison
+                          console.log("End node reached.");
+                          break;
+                      }
+
+                      // Remove u from nodesToVisit (mark as visited)
+                      delete nodesToVisit[u];
+                      visited.add(u);
+                      processedNodes++;
+
+                      // Update distances for neighbors
+                      const neighbors = mapGraph[u]?.neighbors || {};
+                      for (const v in neighbors) {
+                          // Important: Check if neighbor 'v' exists in the distances object (i.e., it's a valid node from the Overpass data)
+                          if (distances.hasOwnProperty(v) && !visited.has(v)) {
+                              const alt = distances[u] + neighbors[v];
+                              if (alt < distances[v]) {
+                                  distances[v] = alt;
+                                  prev[v] = u; // Store as string key if needed
+                              }
+                          }
+                      }
+
+                       // Optional: Add a yield mechanism if it still freezes on complex but allowed graphs
+                       // if (processedNodes % 500 === 0) { // Every 500 nodes
+                       //     await new Promise(resolve => setTimeout(resolve, 0)); // Yield to browser
+                       //     console.log(`Dijkstra progress: ${processedNodes}/${nodeCount}`);
+                       //     updateInfoPanel(`Calculating... (${processedNodes}/${nodeCount})`, 'loading');
+                       // }
+                 } // End while loop
+
+
+                 // Path Reconstruction
+                 const path = [];
+                 let totalDistance = distances[endNodeId];
+
+                  // Check if a path was found
+                 if (totalDistance === Infinity || (prev[endNodeId] === null && startNodeId != endNodeId) ) {
+                    console.error(`No path found between ${startNodeId} and ${endNodeId}.`);
+                    updateInfoPanel('Could not find a route. Roads might not be connected, or the area is too complex.', 'warning');
+                    isLoading = false;
+                    return;
+                 }
+
+                 let current = endNodeId.toString(); // Ensure string key for lookup
+                 while (current !== null) {
+                     path.unshift(parseInt(current, 10));
+                     const prevNode = prev[current];
+                     current = prevNode ? prevNode.toString() : null; // Ensure string for next lookup
+                 }
+
+
+                 console.log(`Path found with ${path.length} nodes. Total distance: ${totalDistance.toFixed(2)} km`);
+                 drawRoute(path);
+
+                 const etaMinutes = (totalDistance / DEFAULT_SPEED_KMH) * 60;
+                 updateInfoPanel(
+                    `<strong class="result-message">Route Found:</strong><br>
+                     Distance: ${totalDistance.toFixed(2)} km<br>
+                     Estimated Time: ${etaMinutes.toFixed(0)} minutes (at ${DEFAULT_SPEED_KMH} km/h)`,
+                    'result' // Use 'result' type
+                 );
+
+                 isLoading = false;
+            }
+
+            /**
+             * Draws the route polyline. (Minor improvements for robustness)
+             * @param {number[]} pathNodeIds - Array of node IDs.
+             */
+            function drawRoute(pathNodeIds) {
+                resetRouteDisplay(); // Clear previous route first
+
+                if (!pathNodeIds || pathNodeIds.length < 1) {
+                    console.warn("DrawRoute called with empty or invalid path.");
+                    return;
+                }
+
+                const latLngs = pathNodeIds
+                    .map(nodeId => nodesLookup[nodeId] ? [nodesLookup[nodeId].lat, nodesLookup[nodeId].lon] : null)
+                    .filter(coords => coords !== null); // Ensure only valid coords
+
+                if (latLngs.length < 1) {
+                     console.warn("No valid coordinates for path nodes.");
+                     return;
+                }
+
+                if (latLngs.length === 1) {
+                    // If path has only one node (start=end case), show a marker instead of line
+                    L.circleMarker(latLngs[0], { radius: 8, color: 'red', fillColor: '#f03', fillOpacity: 0.8 }).addTo(routeLayerGroup);
+                    map.setView(latLngs[0], 16); // Zoom to the point
+                } else {
+                    const polyline = L.polyline(latLngs, { color: 'red', weight: 5, opacity: 0.8 }).addTo(routeLayerGroup);
+                    map.fitBounds(polyline.getBounds().pad(0.1)); // Zoom to fit route
+                }
+            }
+
+             /**
+             * Clears only the visual route elements from the map.
+             */
+             function resetRouteDisplay() {
+                  routeLayerGroup.clearLayers();
+             }
+
+
+            /**
+             * Resets the entire map state.
+             */
+            function resetMap() {
+                console.log("Resetting map...");
+                if (isLoading) {
+                    console.warn("Attempted reset while loading, cancelling pending operations might be needed in future.");
+                    // Ideally, implement AbortController for fetch if needed
+                }
+                isLoading = false; // Ensure loading is stopped
+
+                if (startMarker) map.removeLayer(startMarker);
+                if (endMarker) map.removeLayer(endMarker);
+                startMarker = null;
+                endMarker = null;
+                startCoords = null;
+                endCoords = null;
+                mapGraph = {};
+                nodesLookup = {};
+
+                resetRouteDisplay(); // Clear route line
+                updateInfoPanel('Click on the map to set the <strong>Start</strong> point.');
+            }
+
+            // --- Event Listeners ---
+
+            map.on('click', function (e) {
+                if (isLoading) {
+                    updateInfoPanel("Please wait, calculation in progress...", "loading");
+                    return;
+                }
+
+                const clickedCoords = e.latlng;
+
+                if (!startMarker) {
+                    startMarker = L.marker(clickedCoords).addTo(map).bindPopup("<b>Start Point</b>").openPopup();
+                    startCoords = clickedCoords;
+                    updateInfoPanel('Click on the map to set the <strong>End</strong> point.', 'status');
+                } else if (!endMarker) {
+                    endMarker = L.marker(clickedCoords).addTo(map).bindPopup("<b>End Point</b>").openPopup();
+                    endCoords = clickedCoords;
+
+                     setTimeout(() => { // Auto-close popups
+                         if(startMarker) startMarker.closePopup();
+                         if(endMarker) endMarker.closePopup();
+                     }, 1500);
+
+                    fetchOsmData(); // Trigger calculation
+                }
+            });
+
+            resetButton.addEventListener('click', resetMap);
+
+        }); // End DOMContentLoaded
+    </script>
+
+</body>
+</html>
